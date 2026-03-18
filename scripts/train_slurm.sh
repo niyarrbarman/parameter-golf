@@ -13,7 +13,7 @@
 #SBATCH -n 4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:2
-#SBATCH -p full-gpu
+#SBATCH -p small
 #SBATCH --time=00:30:00
 #SBATCH --output=slurm/%x_%j.out
 
