@@ -26,6 +26,10 @@ echo "Variant:      ${VARIANT}"
 echo "Train shards: ${TRAIN_SHARDS}"
 echo "=========================================="
 
+# --- Redirect HF cache to tmpdir (avoid filling home directory quota) ---------
+export HF_HOME="${DATA_ROOT}/.hf_cache"
+mkdir -p "${HF_HOME}"
+
 # --- Create target directories ------------------------------------------------
 mkdir -p "${DATA_ROOT}/datasets"
 mkdir -p "${DATA_ROOT}/tokenizers"
