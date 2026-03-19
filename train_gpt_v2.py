@@ -320,13 +320,18 @@ def scale_rope_yarn(
             dim = module.inv_freq.numel() * 2
             # Original inverse frequencies.
             orig_inv_freq = 1.0 / (original_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-            # Wavelength thresholds for interpolation boundaries.
-            freq_low = 1.0 / (beta_fast / (2 * math.pi / train_seq_len))  # high freq boundary
-            freq_high = 1.0 / (beta_slow / (2 * math.pi / train_seq_len))  # low freq boundary
-            # Per-dimension interpolation factor: 0 = extrapolate, 1 = interpolate.
-            # Smooth linear ramp between freq_low and freq_high.
-            ramp = torch.clamp((orig_inv_freq - freq_low) / (freq_high - freq_low + 1e-12), 0.0, 1.0)
-            # Interpolated inv_freq: blend between original (extrapolate) and scaled (interpolate).
+            # Compute wavelengths per dimension: wavelength = 2*pi / freq
+            wavelengths = 2.0 * math.pi / orig_inv_freq
+            # Wavelength boundaries (YaRN paper convention).
+            low_freq_wavelen = train_seq_len / beta_fast   # short wavelength = high freq boundary
+            high_freq_wavelen = train_seq_len / beta_slow  # long wavelength = low freq boundary
+            # ramp: 0 for high-freq dims (short wavelength, extrapolate/keep original),
+            #        1 for low-freq dims (long wavelength, interpolate/divide by scale).
+            ramp = torch.clamp(
+                (wavelengths - low_freq_wavelen) / (high_freq_wavelen - low_freq_wavelen + 1e-12),
+                0.0, 1.0,
+            )
+            # Blend: original (extrapolate) where ramp=0, scaled down (interpolate) where ramp=1.
             scaled_inv_freq = orig_inv_freq * (1.0 - ramp) + (orig_inv_freq / scale) * ramp
             module.inv_freq.copy_(scaled_inv_freq.to(module.inv_freq.device))
             module._seq_len_cached = 0
@@ -908,6 +913,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    torch._dynamo.config.recompile_limit = 32  # eval sweep uses many seq_len/scaling combos
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
