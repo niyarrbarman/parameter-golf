@@ -74,7 +74,7 @@ class Hyperparameters:
 
     # Test-time training (TTT): adapt model on validation data during eval.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 1e-4))
+    ttt_lr = float(os.environ.get("TTT_LR", 1e-5))
     ttt_max_seconds = float(os.environ.get("TTT_MAX_SECONDS", 540.0))  # 9 min budget for TTT
 
     # Optimizer hyperparameters.
@@ -333,7 +333,7 @@ def eval_val_ttt(
     seq_len_override: int | None = None,
     log_fn=None,
 ) -> tuple[float, float]:
-    """Evaluate with test-time training: score each batch, then adapt the model for future batches."""
+    """Evaluate with test-time training: score each batch, then adapt MLP weights for future batches."""
     eval_seq_len = seq_len_override if seq_len_override is not None else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < eval_seq_len:
@@ -349,8 +349,21 @@ def eval_val_ttt(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # TTT optimizer: simple SGD, no momentum (stateless, adapts quickly).
-    ttt_optimizer = torch.optim.SGD(model.parameters(), lr=args.ttt_lr)
+    # Freeze everything, then selectively unfreeze MLP weights only.
+    for p in model.parameters():
+        p.requires_grad_(False)
+    ttt_params = []
+    for module in model.modules():
+        if isinstance(module, MLP):
+            for p in module.parameters():
+                p.requires_grad_(True)
+                ttt_params.append(p)
+    ttt_param_count = sum(p.numel() for p in ttt_params)
+    if log_fn:
+        log_fn(f"ttt: adapting {ttt_param_count} MLP params ({len(ttt_params)} tensors), lr={args.ttt_lr}")
+
+    # AdamW: smooth updates, weight decay prevents drift from pretrained weights.
+    ttt_optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.01, betas=(0.9, 0.999))
 
     t_start = time.perf_counter()
     batch_count = 0
@@ -361,7 +374,7 @@ def eval_val_ttt(
         if elapsed > args.ttt_max_seconds:
             if log_fn:
                 log_fn(f"ttt: time budget exhausted at batch {batch_count}, {elapsed:.1f}s elapsed")
-            # Score remaining batches without TTT adaptation.
+            # Score remaining batches without further adaptation.
             model.eval()
             with torch.inference_mode():
                 for remaining_start in range(batch_seq_start, seq_end, local_batch_seqs):
@@ -404,7 +417,7 @@ def eval_val_ttt(
         token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
         val_byte_count += token_bytes.to(torch.float64).sum()
 
-        # Phase 2: Adapt model on this batch (benefits future batches).
+        # Phase 2: Adapt MLP weights on this batch (benefits future batches).
         model.train()
         ttt_optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
@@ -414,6 +427,10 @@ def eval_val_ttt(
         ttt_optimizer.zero_grad(set_to_none=True)
 
         batch_count += 1
+
+    # Restore requires_grad for all params.
+    for p in model.parameters():
+        p.requires_grad_(True)
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
