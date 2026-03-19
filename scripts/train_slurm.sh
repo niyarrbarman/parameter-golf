@@ -47,10 +47,9 @@ MLP_MULT="${MLP_MULT:-2}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 
 # --- v2 extras (ignored by baseline train_gpt.py) ----------------------------
-EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-2048}"
-TTT_ENABLED="${TTT_ENABLED:-1}"
-TTT_LR="${TTT_LR:-1e-4}"
-TTT_MAX_SECONDS="${TTT_MAX_SECONDS:-540}"
+EVAL_SEQ_LENS="${EVAL_SEQ_LENS:-1024,2048,4096,8192}"
+YARN_BETA_FAST="${YARN_BETA_FAST:-32.0}"
+YARN_BETA_SLOW="${YARN_BETA_SLOW:-1.0}"
 
 # --- Derived paths ------------------------------------------------------------
 DATA_PATH="${DATA_ROOT}/datasets/fineweb10B_${VARIANT}"
@@ -80,8 +79,8 @@ echo "Iterations:  ${ITERATIONS}"
 echo "Batch tokens:${TRAIN_BATCH_TOKENS}"
 echo "Model:       ${NUM_LAYERS}L ${MODEL_DIM}D ${NUM_HEADS}H ${NUM_KV_HEADS}KV"
 echo "Script:      ${TRAIN_SCRIPT}"
-echo "Eval seqlen: ${EVAL_SEQ_LEN}"
-echo "TTT:         enabled=${TTT_ENABLED} lr=${TTT_LR} max_sec=${TTT_MAX_SECONDS}"
+echo "Eval seqlens:${EVAL_SEQ_LENS}"
+echo "YaRN:       beta_fast=${YARN_BETA_FAST} beta_slow=${YARN_BETA_SLOW}"
 echo "=========================================="
 
 # --- Verify data exists -------------------------------------------------------
@@ -116,10 +115,9 @@ srun apptainer exec \
     --env "NUM_KV_HEADS=${NUM_KV_HEADS}" \
     --env "MLP_MULT=${MLP_MULT}" \
     --env "TIE_EMBEDDINGS=${TIE_EMBEDDINGS}" \
-    --env "EVAL_SEQ_LEN=${EVAL_SEQ_LEN}" \
-    --env "TTT_ENABLED=${TTT_ENABLED}" \
-    --env "TTT_LR=${TTT_LR}" \
-    --env "TTT_MAX_SECONDS=${TTT_MAX_SECONDS}" \
+    --env "EVAL_SEQ_LENS=${EVAL_SEQ_LENS}" \
+    --env "YARN_BETA_FAST=${YARN_BETA_FAST}" \
+    --env "YARN_BETA_SLOW=${YARN_BETA_SLOW}" \
     --bind /tmpdir,/work --nv "${CONTAINER}" \
     torchrun \
         --nnodes=${NNODES} \

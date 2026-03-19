@@ -69,13 +69,11 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    # Evaluation sequence length (can be longer than training seq_len with RoPE scaling).
-    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-
-    # Test-time training (TTT): adapt model on validation data during eval.
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 1e-5))
-    ttt_max_seconds = float(os.environ.get("TTT_MAX_SECONDS", 540.0))  # 9 min budget for TTT
+    # Eval sweep: test multiple sequence lengths with NTK and YaRN RoPE scaling.
+    eval_seq_lens = [int(x) for x in os.environ.get("EVAL_SEQ_LENS", "1024,2048,4096,8192").split(",")]
+    # YaRN parameters (beta_fast/beta_slow control frequency interpolation boundaries).
+    yarn_beta_fast = float(os.environ.get("YARN_BETA_FAST", 32.0))
+    yarn_beta_slow = float(os.environ.get("YARN_BETA_SLOW", 1.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -305,6 +303,35 @@ def scale_rope_for_eval(model: nn.Module, train_seq_len: int, eval_seq_len: int,
             module._seq_len_cached = 0  # Force recompute of cos/sin cache
 
 
+def scale_rope_yarn(
+    model: nn.Module,
+    train_seq_len: int,
+    eval_seq_len: int,
+    original_base: float,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+) -> None:
+    """Apply YaRN RoPE scaling: interpolate low freqs, extrapolate high freqs, smooth ramp between."""
+    if eval_seq_len <= train_seq_len:
+        return
+    scale = eval_seq_len / train_seq_len
+    for module in model.modules():
+        if isinstance(module, Rotary):
+            dim = module.inv_freq.numel() * 2
+            # Original inverse frequencies.
+            orig_inv_freq = 1.0 / (original_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            # Wavelength thresholds for interpolation boundaries.
+            freq_low = 1.0 / (beta_fast / (2 * math.pi / train_seq_len))  # high freq boundary
+            freq_high = 1.0 / (beta_slow / (2 * math.pi / train_seq_len))  # low freq boundary
+            # Per-dimension interpolation factor: 0 = extrapolate, 1 = interpolate.
+            # Smooth linear ramp between freq_low and freq_high.
+            ramp = torch.clamp((orig_inv_freq - freq_low) / (freq_high - freq_low + 1e-12), 0.0, 1.0)
+            # Interpolated inv_freq: blend between original (extrapolate) and scaled (interpolate).
+            scaled_inv_freq = orig_inv_freq * (1.0 - ramp) + (orig_inv_freq / scale) * ramp
+            module.inv_freq.copy_(scaled_inv_freq.to(module.inv_freq.device))
+            module._seq_len_cached = 0
+
+
 def restore_rope(model: nn.Module, original_base: float) -> None:
     """Restore original RoPE frequencies after scaled eval."""
     for module in model.modules():
@@ -313,136 +340,6 @@ def restore_rope(model: nn.Module, original_base: float) -> None:
             inv_freq = 1.0 / (original_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
             module.inv_freq.copy_(inv_freq.to(module.inv_freq.device))
             module._seq_len_cached = 0
-
-
-# -----------------------------
-# TEST-TIME TRAINING (TTT)
-# -----------------------------
-
-def eval_val_ttt(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    seq_len_override: int | None = None,
-    log_fn=None,
-) -> tuple[float, float]:
-    """Evaluate with test-time training: score each batch, then adapt MLP weights for future batches."""
-    eval_seq_len = seq_len_override if seq_len_override is not None else args.train_seq_len
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < eval_seq_len:
-        raise ValueError(
-            f"VAL_BATCH_SIZE too small for TTT eval: {args.val_batch_size} with "
-            f"world_size={world_size}, grad_accum={grad_accum_steps}, seq_len={eval_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // eval_seq_len
-    total_seqs = (val_tokens.numel() - 1) // eval_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    # Freeze everything, then selectively unfreeze MLP weights only.
-    for p in model.parameters():
-        p.requires_grad_(False)
-    ttt_params = []
-    for module in model.modules():
-        if isinstance(module, MLP):
-            for p in module.parameters():
-                p.requires_grad_(True)
-                ttt_params.append(p)
-    ttt_param_count = sum(p.numel() for p in ttt_params)
-    if log_fn:
-        log_fn(f"ttt: adapting {ttt_param_count} MLP params ({len(ttt_params)} tensors), lr={args.ttt_lr}")
-
-    # AdamW: smooth updates, weight decay prevents drift from pretrained weights.
-    ttt_optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.01, betas=(0.9, 0.999))
-
-    t_start = time.perf_counter()
-    batch_count = 0
-
-    for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-        # Check TTT time budget.
-        elapsed = time.perf_counter() - t_start
-        if elapsed > args.ttt_max_seconds:
-            if log_fn:
-                log_fn(f"ttt: time budget exhausted at batch {batch_count}, {elapsed:.1f}s elapsed")
-            # Score remaining batches without further adaptation.
-            model.eval()
-            with torch.inference_mode():
-                for remaining_start in range(batch_seq_start, seq_end, local_batch_seqs):
-                    remaining_end = min(remaining_start + local_batch_seqs, seq_end)
-                    raw_start = remaining_start * eval_seq_len
-                    raw_end = remaining_end * eval_seq_len + 1
-                    local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-                    x = local[:-1].reshape(-1, eval_seq_len)
-                    y = local[1:].reshape(-1, eval_seq_len)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        batch_loss = model(x, y).detach()
-                    batch_token_count = float(y.numel())
-                    val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-                    val_token_count += batch_token_count
-                    prev_ids = x.reshape(-1)
-                    tgt_ids = y.reshape(-1)
-                    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-                    val_byte_count += token_bytes.to(torch.float64).sum()
-            break
-
-        batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-        raw_start = batch_seq_start * eval_seq_len
-        raw_end = batch_seq_end * eval_seq_len + 1
-        local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-        x = local[:-1].reshape(-1, eval_seq_len)
-        y = local[1:].reshape(-1, eval_seq_len)
-
-        # Phase 1: Score this batch (loss computed BEFORE adaptation — no information leak).
-        model.eval()
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                score_loss = model(x, y).detach()
-        batch_token_count = float(y.numel())
-        val_loss_sum += score_loss.to(torch.float64) * batch_token_count
-        val_token_count += batch_token_count
-        prev_ids = x.reshape(-1)
-        tgt_ids = y.reshape(-1)
-        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-        val_byte_count += token_bytes.to(torch.float64).sum()
-
-        # Phase 2: Adapt MLP weights on this batch (benefits future batches).
-        model.train()
-        ttt_optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            ttt_loss = model(x, y)
-        ttt_loss.backward()
-        ttt_optimizer.step()
-        ttt_optimizer.zero_grad(set_to_none=True)
-
-        batch_count += 1
-
-    # Restore requires_grad for all params.
-    for p in model.parameters():
-        p.requires_grad_(True)
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -564,32 +461,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
-
-def apply_fake_quantize_noise(model: nn.Module) -> None:
-    """Simulate int8 quantization error as additive noise (straight-through estimator).
-    This trains the model to be robust to post-training quantization."""
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if not param.is_floating_point() or param.ndim < 2:
-                continue
-            if param.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-                continue
-            if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-                continue
-            t = param.data.float()
-            if t.ndim == 2:
-                clip_abs = torch.quantile(t.abs(), INT8_CLIP_Q, dim=1).clamp_min(1.0 / 127.0)
-                scale = clip_abs / 127.0
-                quantized = torch.clamp(torch.round(t / scale[:, None]), -127, 127)
-                dequantized = quantized * scale[:, None]
-            else:
-                clip_abs = float(torch.quantile(t.abs().flatten(), INT8_CLIP_Q).item())
-                scale = clip_abs / 127.0 if clip_abs > 0 else 1.0
-                quantized = torch.clamp(torch.round(t / scale), -127, 127)
-                dequantized = quantized * scale
-            # Straight-through: replace param with dequantized version.
-            # The gradient flows through as if no quantization happened.
-            param.data.copy_(dequantized.to(param.dtype))
 
 
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
@@ -1005,8 +876,9 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    # Load val tokens aligned to eval_seq_len (which may be longer than train_seq_len).
-    val_seq_len = max(args.train_seq_len, args.eval_seq_len)
+    # Load val tokens aligned to longest eval seq_len.
+    max_eval_seq_len = max(args.eval_seq_lens) if args.eval_seq_lens else args.train_seq_len
+    val_seq_len = max(args.train_seq_len, max_eval_seq_len)
     val_tokens = load_validation_tokens(args.val_files, val_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
@@ -1090,7 +962,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"eval_seq_len:{args.eval_seq_len} ttt_enabled:{args.ttt_enabled} ttt_lr:{args.ttt_lr}")
+    log0(f"eval_seq_lens:{args.eval_seq_lens} yarn_beta_fast:{args.yarn_beta_fast} yarn_beta_slow:{args.yarn_beta_slow}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1296,117 +1168,74 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
 
-    # --- Eval 1: Standard eval at training seq_len (baseline comparison) ---
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    # --- Eval sweep: test each seq_len with no scaling, NTK, and YaRN ---
+    log0("=" * 60)
+    log0("EVAL SWEEP: seq_len x scaling_method")
+    log0("=" * 60)
 
-    # --- Eval 2: Long-context eval with NTK-aware RoPE scaling ---
-    if args.eval_seq_len > args.train_seq_len:
-        # Reload clean quantized weights (TTT may have modified them later).
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        scale_rope_for_eval(base_model, args.train_seq_len, args.eval_seq_len, args.rope_base)
+    dequant_state_cpu = dequantize_state_dict_int8(quant_state)
+
+    for eval_sl in sorted(args.eval_seq_lens):
+        if eval_sl == args.train_seq_len:
+            # Standard eval at training seq_len (no scaling needed).
+            base_model.load_state_dict(dequant_state_cpu, strict=True)
+            torch.cuda.synchronize()
+            t_ev = time.perf_counter()
+            v_loss, v_bpb = eval_val(
+                args, model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"eval seq={eval_sl} method=none "
+                f"val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} "
+                f"time:{1000.0 * (time.perf_counter() - t_ev):.0f}ms"
+            )
+            log0(f"eval_exact seq={eval_sl} method=none val_loss:{v_loss:.8f} val_bpb:{v_bpb:.8f}")
+            continue
+
+        # NTK scaling.
+        base_model.load_state_dict(dequant_state_cpu, strict=True)
+        scale_rope_for_eval(base_model, args.train_seq_len, eval_sl, args.rope_base)
         torch.cuda.synchronize()
-        t_longeval = time.perf_counter()
-        q_val_loss_long, q_val_bpb_long = eval_val(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            seq_len_override=args.eval_seq_len,
+        t_ev = time.perf_counter()
+        v_loss, v_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            seq_len_override=eval_sl,
         )
         torch.cuda.synchronize()
         log0(
-            f"final_longctx_ntk(seq={args.eval_seq_len}) "
-            f"val_loss:{q_val_loss_long:.4f} val_bpb:{q_val_bpb_long:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_longeval):.0f}ms"
+            f"eval seq={eval_sl} method=ntk "
+            f"val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} "
+            f"time:{1000.0 * (time.perf_counter() - t_ev):.0f}ms"
         )
-        log0(
-            f"final_longctx_ntk_exact val_loss:{q_val_loss_long:.8f} "
-            f"val_bpb:{q_val_bpb_long:.8f}"
-        )
+        log0(f"eval_exact seq={eval_sl} method=ntk val_loss:{v_loss:.8f} val_bpb:{v_bpb:.8f}")
         restore_rope(base_model, args.rope_base)
 
-    # --- Eval 3: Test-Time Training (TTT) at training seq_len ---
-    if args.ttt_enabled:
-        # Reload clean quantized weights for TTT.
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        # YaRN scaling.
+        base_model.load_state_dict(dequant_state_cpu, strict=True)
+        scale_rope_yarn(
+            base_model, args.train_seq_len, eval_sl, args.rope_base,
+            beta_fast=args.yarn_beta_fast, beta_slow=args.yarn_beta_slow,
+        )
         torch.cuda.synchronize()
-        t_ttt = time.perf_counter()
-        # Use base_model directly (not compiled/DDP) for TTT since we need backward passes.
-        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            log_fn=log0,
+        t_ev = time.perf_counter()
+        v_loss, v_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            seq_len_override=eval_sl,
         )
         torch.cuda.synchronize()
         log0(
-            f"final_ttt(lr={args.ttt_lr}) "
-            f"val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+            f"eval seq={eval_sl} method=yarn "
+            f"val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} "
+            f"time:{1000.0 * (time.perf_counter() - t_ev):.0f}ms"
         )
-        log0(f"final_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
+        log0(f"eval_exact seq={eval_sl} method=yarn val_loss:{v_loss:.8f} val_bpb:{v_bpb:.8f}")
+        restore_rope(base_model, args.rope_base)
 
-    # --- Eval 4: TTT + NTK long-context (the full combo) ---
-    if args.ttt_enabled and args.eval_seq_len > args.train_seq_len:
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        scale_rope_for_eval(base_model, args.train_seq_len, args.eval_seq_len, args.rope_base)
-        torch.cuda.synchronize()
-        t_ttt_long = time.perf_counter()
-        ttt_long_val_loss, ttt_long_val_bpb = eval_val_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            seq_len_override=args.eval_seq_len,
-            log_fn=log0,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_ttt_longctx_ntk(seq={args.eval_seq_len}, lr={args.ttt_lr}) "
-            f"val_loss:{ttt_long_val_loss:.4f} val_bpb:{ttt_long_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt_long):.0f}ms"
-        )
-        log0(
-            f"final_ttt_longctx_ntk_exact val_loss:{ttt_long_val_loss:.8f} "
-            f"val_bpb:{ttt_long_val_bpb:.8f}"
-        )
+    log0("=" * 60)
 
     if distributed:
         dist.destroy_process_group()
