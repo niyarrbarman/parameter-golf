@@ -52,7 +52,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 800))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -61,22 +61,21 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 5))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 672))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    # Depth recurrence: loop through the unique layers this many times.
-    num_recurrence_loops = int(os.environ.get("NUM_RECURRENCE_LOOPS", 2))
-    # Evaluation sequence length (can be longer than training seq_len thanks to RoPE).
-    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 4096))
+    # Evaluation sequence length (can be longer than training seq_len with RoPE scaling).
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
 
-    # QAT: fraction of training after which fake-quantization noise is injected.
-    # Set to 1.0 to disable (disabled by default — quant gap is tiny, QAT disrupts convergence).
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 1.0))
+    # Test-time training (TTT): adapt model on validation data during eval.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 1e-4))
+    ttt_max_seconds = float(os.environ.get("TTT_MAX_SECONDS", 540.0))  # 9 min budget for TTT
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -286,6 +285,147 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+# -----------------------------
+# NTK-AWARE ROPE SCALING
+# -----------------------------
+
+def scale_rope_for_eval(model: nn.Module, train_seq_len: int, eval_seq_len: int, original_base: float) -> None:
+    """Apply NTK-aware RoPE scaling so the model can handle longer sequences at eval time."""
+    if eval_seq_len <= train_seq_len:
+        return
+    scale = eval_seq_len / train_seq_len
+    for module in model.modules():
+        if isinstance(module, Rotary):
+            dim = module.inv_freq.numel() * 2
+            scaled_base = original_base * (scale ** (dim / (dim - 2)))
+            inv_freq = 1.0 / (scaled_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            module.inv_freq.copy_(inv_freq.to(module.inv_freq.device))
+            module._seq_len_cached = 0  # Force recompute of cos/sin cache
+
+
+def restore_rope(model: nn.Module, original_base: float) -> None:
+    """Restore original RoPE frequencies after scaled eval."""
+    for module in model.modules():
+        if isinstance(module, Rotary):
+            dim = module.inv_freq.numel() * 2
+            inv_freq = 1.0 / (original_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            module.inv_freq.copy_(inv_freq.to(module.inv_freq.device))
+            module._seq_len_cached = 0
+
+
+# -----------------------------
+# TEST-TIME TRAINING (TTT)
+# -----------------------------
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    seq_len_override: int | None = None,
+    log_fn=None,
+) -> tuple[float, float]:
+    """Evaluate with test-time training: score each batch, then adapt the model for future batches."""
+    eval_seq_len = seq_len_override if seq_len_override is not None else args.train_seq_len
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < eval_seq_len:
+        raise ValueError(
+            f"VAL_BATCH_SIZE too small for TTT eval: {args.val_batch_size} with "
+            f"world_size={world_size}, grad_accum={grad_accum_steps}, seq_len={eval_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // eval_seq_len
+    total_seqs = (val_tokens.numel() - 1) // eval_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # TTT optimizer: simple SGD, no momentum (stateless, adapts quickly).
+    ttt_optimizer = torch.optim.SGD(model.parameters(), lr=args.ttt_lr)
+
+    t_start = time.perf_counter()
+    batch_count = 0
+
+    for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+        # Check TTT time budget.
+        elapsed = time.perf_counter() - t_start
+        if elapsed > args.ttt_max_seconds:
+            if log_fn:
+                log_fn(f"ttt: time budget exhausted at batch {batch_count}, {elapsed:.1f}s elapsed")
+            # Score remaining batches without TTT adaptation.
+            model.eval()
+            with torch.inference_mode():
+                for remaining_start in range(batch_seq_start, seq_end, local_batch_seqs):
+                    remaining_end = min(remaining_start + local_batch_seqs, seq_end)
+                    raw_start = remaining_start * eval_seq_len
+                    raw_end = remaining_end * eval_seq_len + 1
+                    local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                    x = local[:-1].reshape(-1, eval_seq_len)
+                    y = local[1:].reshape(-1, eval_seq_len)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        batch_loss = model(x, y).detach()
+                    batch_token_count = float(y.numel())
+                    val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                    val_token_count += batch_token_count
+                    prev_ids = x.reshape(-1)
+                    tgt_ids = y.reshape(-1)
+                    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                    val_byte_count += token_bytes.to(torch.float64).sum()
+            break
+
+        batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+        raw_start = batch_seq_start * eval_seq_len
+        raw_end = batch_seq_end * eval_seq_len + 1
+        local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+        x = local[:-1].reshape(-1, eval_seq_len)
+        y = local[1:].reshape(-1, eval_seq_len)
+
+        # Phase 1: Score this batch (loss computed BEFORE adaptation — no information leak).
+        model.eval()
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                score_loss = model(x, y).detach()
+        batch_token_count = float(y.numel())
+        val_loss_sum += score_loss.to(torch.float64) * batch_token_count
+        val_token_count += batch_token_count
+        prev_ids = x.reshape(-1)
+        tgt_ids = y.reshape(-1)
+        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+        val_byte_count += token_bytes.to(torch.float64).sum()
+
+        # Phase 2: Adapt model on this batch (benefits future batches).
+        model.train()
+        ttt_optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            ttt_loss = model(x, y)
+        ttt_loss.backward()
+        ttt_optimizer.step()
+        ttt_optimizer.zero_grad(set_to_none=True)
+
+        batch_count += 1
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -696,7 +836,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        num_recurrence_loops: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -704,13 +843,9 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.num_recurrence_loops = num_recurrence_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        # With recurrence, we have num_layers unique blocks but loop through them
-        # num_recurrence_loops times, giving effective_depth = num_layers * num_recurrence_loops.
-        effective_depth = num_layers * num_recurrence_loops
-        self.num_encoder_layers = effective_depth // 2
-        self.num_decoder_layers = effective_depth - self.num_encoder_layers
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -723,10 +858,9 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
-        self.num_unique_layers = num_layers
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -740,28 +874,20 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _get_block(self, virtual_idx: int) -> Block:
-        """Map virtual layer index to physical block via modular weight sharing."""
-        return self.blocks[virtual_idx % self.num_unique_layers]
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        effective_depth = self.num_unique_layers * self.num_recurrence_loops
-        enc_layers = effective_depth // 2
-        dec_layers = effective_depth - enc_layers
-
         # First half stores skips; second half reuses them in reverse order.
-        for i in range(enc_layers):
-            x = self._get_block(i)(x, x0)
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(dec_layers):
+        for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self._get_block(enc_layers + i)(x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -888,7 +1014,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        num_recurrence_loops=args.num_recurrence_loops,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -947,9 +1072,8 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    effective_depth = args.num_layers * args.num_recurrence_loops
-    log0(f"model_params:{n_params} unique_layers:{args.num_layers} effective_depth:{effective_depth}")
-    log0(f"eval_seq_len:{args.eval_seq_len} qat_start_frac:{args.qat_start_frac}")
+    log0(f"model_params:{n_params}")
+    log0(f"eval_seq_len:{args.eval_seq_len} ttt_enabled:{args.ttt_enabled} ttt_lr:{args.ttt_lr}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1087,12 +1211,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-
-        # QAT: inject fake quantization noise after optimizer step, once past qat_start_frac.
-        elapsed_frac = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / args.iterations
-        if elapsed_frac >= args.qat_start_frac:
-            apply_fake_quantize_noise(base_model)
-
         zero_grad_all()
 
         step += 1
@@ -1160,7 +1278,8 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
-    # Final eval at training seq_len for comparison.
+
+    # --- Eval 1: Standard eval at training seq_len (baseline comparison) ---
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
@@ -1176,13 +1295,16 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    # Final eval at longer eval_seq_len for the real submission score.
+    # --- Eval 2: Long-context eval with NTK-aware RoPE scaling ---
     if args.eval_seq_len > args.train_seq_len:
+        # Reload clean quantized weights (TTT may have modified them later).
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        scale_rope_for_eval(base_model, args.train_seq_len, args.eval_seq_len, args.rope_base)
         torch.cuda.synchronize()
         t_longeval = time.perf_counter()
         q_val_loss_long, q_val_bpb_long = eval_val(
@@ -1200,13 +1322,73 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int8_zlib_roundtrip_longctx(seq={args.eval_seq_len}) "
+            f"final_longctx_ntk(seq={args.eval_seq_len}) "
             f"val_loss:{q_val_loss_long:.4f} val_bpb:{q_val_bpb_long:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_longeval):.0f}ms"
         )
         log0(
-            f"final_int8_zlib_roundtrip_longctx_exact val_loss:{q_val_loss_long:.8f} "
+            f"final_longctx_ntk_exact val_loss:{q_val_loss_long:.8f} "
             f"val_bpb:{q_val_bpb_long:.8f}"
+        )
+        restore_rope(base_model, args.rope_base)
+
+    # --- Eval 3: Test-Time Training (TTT) at training seq_len ---
+    if args.ttt_enabled:
+        # Reload clean quantized weights for TTT.
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        # Use base_model directly (not compiled/DDP) for TTT since we need backward passes.
+        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt(lr={args.ttt_lr}) "
+            f"val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
+
+    # --- Eval 4: TTT + NTK long-context (the full combo) ---
+    if args.ttt_enabled and args.eval_seq_len > args.train_seq_len:
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        scale_rope_for_eval(base_model, args.train_seq_len, args.eval_seq_len, args.rope_base)
+        torch.cuda.synchronize()
+        t_ttt_long = time.perf_counter()
+        ttt_long_val_loss, ttt_long_val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            seq_len_override=args.eval_seq_len,
+            log_fn=log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt_longctx_ntk(seq={args.eval_seq_len}, lr={args.ttt_lr}) "
+            f"val_loss:{ttt_long_val_loss:.4f} val_bpb:{ttt_long_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt_long):.0f}ms"
+        )
+        log0(
+            f"final_ttt_longctx_ntk_exact val_loss:{ttt_long_val_loss:.8f} "
+            f"val_bpb:{ttt_long_val_bpb:.8f}"
         )
 
     if distributed:

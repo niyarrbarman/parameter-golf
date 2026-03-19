@@ -15,7 +15,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:2
 #SBATCH -p small
-#SBATCH --time=00:30:00
+#SBATCH --time=00:45:00
 #SBATCH --output=slurm/%x_%j.out
 
 mkdir -p slurm
@@ -47,9 +47,10 @@ MLP_MULT="${MLP_MULT:-2}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 
 # --- v2 extras (ignored by baseline train_gpt.py) ----------------------------
-NUM_RECURRENCE_LOOPS="${NUM_RECURRENCE_LOOPS:-1}"
-EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-1024}"
-QAT_START_FRAC="${QAT_START_FRAC:-0.5}"
+EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-2048}"
+TTT_ENABLED="${TTT_ENABLED:-1}"
+TTT_LR="${TTT_LR:-1e-4}"
+TTT_MAX_SECONDS="${TTT_MAX_SECONDS:-540}"
 
 # --- Derived paths ------------------------------------------------------------
 DATA_PATH="${DATA_ROOT}/datasets/fineweb10B_${VARIANT}"
@@ -79,9 +80,8 @@ echo "Iterations:  ${ITERATIONS}"
 echo "Batch tokens:${TRAIN_BATCH_TOKENS}"
 echo "Model:       ${NUM_LAYERS}L ${MODEL_DIM}D ${NUM_HEADS}H ${NUM_KV_HEADS}KV"
 echo "Script:      ${TRAIN_SCRIPT}"
-echo "Recurrence:  ${NUM_RECURRENCE_LOOPS}x (eff. depth $((NUM_LAYERS * NUM_RECURRENCE_LOOPS)))"
 echo "Eval seqlen: ${EVAL_SEQ_LEN}"
-echo "QAT start:   ${QAT_START_FRAC}"
+echo "TTT:         enabled=${TTT_ENABLED} lr=${TTT_LR} max_sec=${TTT_MAX_SECONDS}"
 echo "=========================================="
 
 # --- Verify data exists -------------------------------------------------------
@@ -116,9 +116,10 @@ srun apptainer exec \
     --env "NUM_KV_HEADS=${NUM_KV_HEADS}" \
     --env "MLP_MULT=${MLP_MULT}" \
     --env "TIE_EMBEDDINGS=${TIE_EMBEDDINGS}" \
-    --env "NUM_RECURRENCE_LOOPS=${NUM_RECURRENCE_LOOPS}" \
     --env "EVAL_SEQ_LEN=${EVAL_SEQ_LEN}" \
-    --env "QAT_START_FRAC=${QAT_START_FRAC}" \
+    --env "TTT_ENABLED=${TTT_ENABLED}" \
+    --env "TTT_LR=${TTT_LR}" \
+    --env "TTT_MAX_SECONDS=${TTT_MAX_SECONDS}" \
     --bind /tmpdir,/work --nv "${CONTAINER}" \
     torchrun \
         --nnodes=${NNODES} \
