@@ -68,12 +68,14 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 15.0))
     # Eval sweep: test multiple sequence lengths with NTK and YaRN RoPE scaling.
     eval_seq_lens = [int(x) for x in os.environ.get("EVAL_SEQ_LENS", "1024,2048,4096,8192").split(",")]
     # YaRN parameters (beta_fast/beta_slow control frequency interpolation boundaries).
     yarn_beta_fast = float(os.environ.get("YARN_BETA_FAST", 32.0))
     yarn_beta_slow = float(os.environ.get("YARN_BETA_SLOW", 1.0))
+    # Multi-token prediction: auxiliary loss on token t+2 improves sample efficiency.
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.3))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -650,11 +652,14 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, val_embed_out: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Add value embeddings: inject token identity directly into value stream.
+        if val_embed_out is not None:
+            v = v + val_embed_out
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -706,10 +711,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, val_embed_out: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), val_embed_out=val_embed_out)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -729,6 +734,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mtp_loss_weight: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -736,7 +742,11 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # Value embeddings: shared across all attention layers, adds token identity to V stream.
+        kv_dim = (num_kv_heads * model_dim) // num_heads
+        self.val_embed = nn.Embedding(vocab_size, kv_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -758,40 +768,67 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # Multi-token prediction: small projection from hidden state to predict token t+2.
+        if mtp_loss_weight > 0:
+            self.mtp_proj = CastedLinear(model_dim, model_dim, bias=False)
+            self.mtp_proj._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.zeros_(self.val_embed.weight)  # Start with no value embedding contribution
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+    def _compute_logits(self, x: Tensor) -> Tensor:
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        # Value embeddings: compute once, reuse across all layers.
+        bsz, seqlen = input_ids.shape
+        ve = self.val_embed(input_ids)  # (bsz, seqlen, kv_dim)
+        num_kv_heads = self.blocks[0].attn.num_kv_heads
+        head_dim = self.blocks[0].attn.head_dim
+        val_embed_out = ve.reshape(bsz, seqlen, num_kv_heads, head_dim).transpose(1, 2)
+        skips: list[Tensor] = []
+
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0, val_embed_out=val_embed_out)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0, val_embed_out=val_embed_out)
+
+        h = self.final_norm(x)  # (bsz, seqlen, dim)
+        h_flat = h.reshape(-1, h.size(-1))
+        targets = target_ids.reshape(-1)
+        logits = self._compute_logits(h_flat)
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        # Multi-token prediction: predict token t+2 from hidden state at position t.
+        # Only active during training -- eval loss must be pure next-token CE.
+        if self.training and self.mtp_loss_weight > 0 and target_ids.size(1) > 1:
+            # target_ids[:, 1:] are the t+2 targets (since target_ids is already shifted by 1).
+            mtp_targets = target_ids[:, 1:].reshape(-1)
+            mtp_h = self.mtp_proj(h[:, :-1])  # (bsz, seqlen-1, dim)
+            mtp_logits = self._compute_logits(mtp_h.reshape(-1, mtp_h.size(-1)))
+            mtp_loss = F.cross_entropy(mtp_logits.float(), mtp_targets, reduction="mean")
+            loss = loss + self.mtp_loss_weight * mtp_loss
+
+        return loss
 
 
 # -----------------------------
@@ -908,6 +945,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mtp_loss_weight=args.mtp_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -935,9 +973,15 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # MTP projection is a top-level matrix param, add to Muon.
+    if hasattr(base_model, "mtp_proj"):
+        matrix_params.append(base_model.mtp_proj.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [
+            {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr},
+            {"params": [base_model.val_embed.weight], "lr": token_lr, "base_lr": token_lr},
+        ],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -969,6 +1013,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"eval_seq_lens:{args.eval_seq_lens} yarn_beta_fast:{args.yarn_beta_fast} yarn_beta_slow:{args.yarn_beta_slow}")
+    log0(f"logit_softcap:{args.logit_softcap} mtp_loss_weight:{args.mtp_loss_weight}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")

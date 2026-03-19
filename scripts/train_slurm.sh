@@ -50,6 +50,8 @@ TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 EVAL_SEQ_LENS="${EVAL_SEQ_LENS:-1024,2048,4096,8192}"
 YARN_BETA_FAST="${YARN_BETA_FAST:-32.0}"
 YARN_BETA_SLOW="${YARN_BETA_SLOW:-1.0}"
+LOGIT_SOFTCAP="${LOGIT_SOFTCAP:-15.0}"
+MTP_LOSS_WEIGHT="${MTP_LOSS_WEIGHT:-0.3}"
 
 # --- Derived paths ------------------------------------------------------------
 DATA_PATH="${DATA_ROOT}/datasets/fineweb10B_${VARIANT}"
@@ -81,6 +83,7 @@ echo "Model:       ${NUM_LAYERS}L ${MODEL_DIM}D ${NUM_HEADS}H ${NUM_KV_HEADS}KV"
 echo "Script:      ${TRAIN_SCRIPT}"
 echo "Eval seqlens:${EVAL_SEQ_LENS}"
 echo "YaRN:       beta_fast=${YARN_BETA_FAST} beta_slow=${YARN_BETA_SLOW}"
+echo "Softcap:    ${LOGIT_SOFTCAP} MTP weight: ${MTP_LOSS_WEIGHT}"
 echo "=========================================="
 
 # --- Verify data exists -------------------------------------------------------
@@ -118,6 +121,8 @@ srun apptainer exec \
     --env "EVAL_SEQ_LENS=${EVAL_SEQ_LENS}" \
     --env "YARN_BETA_FAST=${YARN_BETA_FAST}" \
     --env "YARN_BETA_SLOW=${YARN_BETA_SLOW}" \
+    --env "LOGIT_SOFTCAP=${LOGIT_SOFTCAP}" \
+    --env "MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT}" \
     --bind /tmpdir,/work --nv "${CONTAINER}" \
     torchrun \
         --nnodes=${NNODES} \
