@@ -68,14 +68,14 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 15.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     # Eval sweep: test multiple sequence lengths with NTK and YaRN RoPE scaling.
     eval_seq_lens = [int(x) for x in os.environ.get("EVAL_SEQ_LENS", "1024,2048,4096,8192").split(",")]
     # YaRN parameters (beta_fast/beta_slow control frequency interpolation boundaries).
     yarn_beta_fast = float(os.environ.get("YARN_BETA_FAST", 32.0))
     yarn_beta_slow = float(os.environ.get("YARN_BETA_SLOW", 1.0))
     # Multi-token prediction: auxiliary loss on token t+2 improves sample efficiency.
-    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.3))
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
