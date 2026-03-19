@@ -3,7 +3,8 @@
 # Parameter Golf - Baseline Training on 4 nodes x 2 A100-80GB
 #
 # Usage:
-#   sbatch scripts/train_slurm.sh
+#   sbatch scripts/train_slurm.sh                           # baseline
+#   TRAIN_SCRIPT=train_gpt_v2.py sbatch scripts/train_slurm.sh  # v2
 #
 # Override defaults:
 #   RUN_ID=my_experiment sbatch scripts/train_slurm.sh
@@ -25,6 +26,7 @@ DATA_ROOT="${DATA_ROOT:-/tmpdir/m24047brmn/pgolf/data}"
 CONTAINER="${CONTAINER:-/work/conteneurs/calmip/nemo_25.04.03_arm.sif}"
 
 # --- Training config ---------------------------------------------------------
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-train_gpt.py}"
 RUN_ID="${RUN_ID:-baseline_$(date +%Y%m%d_%H%M%S)}"
 VARIANT="${VARIANT:-sp1024}"
 VOCAB_SIZE="${VOCAB_SIZE:-1024}"
@@ -43,6 +45,11 @@ NUM_HEADS="${NUM_HEADS:-8}"
 NUM_KV_HEADS="${NUM_KV_HEADS:-4}"
 MLP_MULT="${MLP_MULT:-2}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
+
+# --- v2 extras (ignored by baseline train_gpt.py) ----------------------------
+NUM_RECURRENCE_LOOPS="${NUM_RECURRENCE_LOOPS:-1}"
+EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-1024}"
+QAT_START_FRAC="${QAT_START_FRAC:-0.5}"
 
 # --- Derived paths ------------------------------------------------------------
 DATA_PATH="${DATA_ROOT}/datasets/fineweb10B_${VARIANT}"
@@ -71,6 +78,10 @@ echo "Wallclock:   ${MAX_WALLCLOCK_SECONDS}s"
 echo "Iterations:  ${ITERATIONS}"
 echo "Batch tokens:${TRAIN_BATCH_TOKENS}"
 echo "Model:       ${NUM_LAYERS}L ${MODEL_DIM}D ${NUM_HEADS}H ${NUM_KV_HEADS}KV"
+echo "Script:      ${TRAIN_SCRIPT}"
+echo "Recurrence:  ${NUM_RECURRENCE_LOOPS}x (eff. depth $((NUM_LAYERS * NUM_RECURRENCE_LOOPS)))"
+echo "Eval seqlen: ${EVAL_SEQ_LEN}"
+echo "QAT start:   ${QAT_START_FRAC}"
 echo "=========================================="
 
 # --- Verify data exists -------------------------------------------------------
@@ -105,6 +116,9 @@ srun apptainer exec \
     --env "NUM_KV_HEADS=${NUM_KV_HEADS}" \
     --env "MLP_MULT=${MLP_MULT}" \
     --env "TIE_EMBEDDINGS=${TIE_EMBEDDINGS}" \
+    --env "NUM_RECURRENCE_LOOPS=${NUM_RECURRENCE_LOOPS}" \
+    --env "EVAL_SEQ_LEN=${EVAL_SEQ_LEN}" \
+    --env "QAT_START_FRAC=${QAT_START_FRAC}" \
     --bind /tmpdir,/work --nv "${CONTAINER}" \
     torchrun \
         --nnodes=${NNODES} \
@@ -112,7 +126,7 @@ srun apptainer exec \
         --rdzv_id=${SLURM_JOB_ID} \
         --rdzv_backend=c10d \
         --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-        "${PROJECT_DIR}/train_gpt.py"
+        "${PROJECT_DIR}/${TRAIN_SCRIPT}"
 
 status=$?
 echo "=========================================="
