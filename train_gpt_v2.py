@@ -63,19 +63,19 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 6))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 576))
+    model_dim = int(os.environ.get("MODEL_DIM", 672))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     # Depth recurrence: loop through the unique layers this many times.
-    num_recurrence_loops = int(os.environ.get("NUM_RECURRENCE_LOOPS", 3))
+    num_recurrence_loops = int(os.environ.get("NUM_RECURRENCE_LOOPS", 2))
     # Evaluation sequence length (can be longer than training seq_len thanks to RoPE).
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
 
     # QAT: fraction of training after which fake-quantization noise is injected.
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.5))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.75))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
