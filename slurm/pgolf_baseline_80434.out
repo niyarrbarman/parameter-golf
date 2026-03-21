@@ -1,0 +1,144 @@
+==========================================
+Parameter Golf - Training
+Project:     /work/m24047/m24047brmn/parameter-golf
+Container:   /work/conteneurs/calmip/nemo_25.04.03_arm.sif
+Data:        /tmpdir/m24047brmn/pgolf/data/datasets/fineweb10B_sp1024
+Tokenizer:   /tmpdir/m24047brmn/pgolf/data/tokenizers/fineweb_1024_bpe.model
+Run ID:      v2_13L_sparse_tale
+Nodes:       4
+GPUs/node:   2
+World size:  8
+Master:      turpancomp3:40435
+Wallclock:   600s
+Iterations:  20000
+Batch tokens:524288
+Model:       13L 512D 8H 4KV
+Script:      train_gpt_v2.py
+Eval seqlens:1024,2048,4096,8192
+YaRN:       beta_fast=32.0 beta_slow=1.0
+Softcap:    30.0 MTP weight: 0.0
+Sparsity:   0.35 prune_every: 100 TALE: 1
+==========================================
+W0321 02:17:31.349000 234129 torch/distributed/run.py:763] 
+W0321 02:17:31.349000 234129 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.349000 234129 torch/distributed/run.py:763] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0321 02:17:31.349000 234129 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.366000 3495032 torch/distributed/run.py:763] 
+W0321 02:17:31.366000 3495032 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.366000 3495032 torch/distributed/run.py:763] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0321 02:17:31.366000 3495032 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.470000 967152 torch/distributed/run.py:763] 
+W0321 02:17:31.470000 967152 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.470000 967152 torch/distributed/run.py:763] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0321 02:17:31.470000 967152 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.506000 2884055 torch/distributed/run.py:763] 
+W0321 02:17:31.506000 2884055 torch/distributed/run.py:763] *****************************************
+W0321 02:17:31.506000 2884055 torch/distributed/run.py:763] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0321 02:17:31.506000 2884055 torch/distributed/run.py:763] *****************************************
+logs/v2_13L_sparse_tale.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/tmpdir/m24047brmn/pgolf/data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=/tmpdir/m24047brmn/pgolf/data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:24671336
+eval_seq_lens:[1024, 2048, 4096, 8192] yarn_beta_fast:32.0 yarn_beta_slow:1.0
+logit_softcap:30.0 mtp_loss_weight:0.0
+target_sparsity:0.35 prune_every:100 tale_enabled:True
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9346 val_bpb:4.1071 train_time:0ms step_avg:0.01ms
+step:1/20000 train_loss:6.9345 train_time:148ms step_avg:148.38ms
+step:2/20000 train_loss:16.3150 train_time:606ms step_avg:302.90ms
+step:3/20000 train_loss:8.3211 train_time:1090ms step_avg:363.25ms
+step:4/20000 train_loss:6.7420 train_time:1428ms step_avg:356.96ms
+step:5/20000 train_loss:6.8999 train_time:1918ms step_avg:383.63ms
+step:6/20000 train_loss:7.5934 train_time:2378ms step_avg:396.29ms
+step:7/20000 train_loss:6.5412 train_time:2804ms step_avg:400.57ms
+step:8/20000 train_loss:6.2710 train_time:3155ms step_avg:394.36ms
+step:9/20000 train_loss:6.1069 train_time:3519ms step_avg:390.99ms
+step:10/20000 train_loss:5.9777 train_time:4076ms step_avg:407.57ms
+step:100/20000 train_loss:3.3915 train_time:45698ms step_avg:456.98ms
+step:200/20000 train_loss:2.8164 train_time:89660ms step_avg:448.30ms
+step:300/20000 train_loss:2.4448 train_time:133269ms step_avg:444.23ms
+step:400/20000 train_loss:2.3133 train_time:178178ms step_avg:445.45ms
+step:500/20000 train_loss:2.4476 train_time:221756ms step_avg:443.51ms
+step:500/20000 val_loss:2.4455 val_bpb:1.4484 train_time:222179ms step_avg:444.36ms
+step:600/20000 train_loss:2.4851 train_time:265311ms step_avg:442.19ms
+step:700/20000 train_loss:2.3815 train_time:309355ms step_avg:441.94ms
+step:800/20000 train_loss:2.2311 train_time:353767ms step_avg:442.21ms
+step:900/20000 train_loss:2.2698 train_time:397720ms step_avg:441.91ms
+step:1000/20000 train_loss:2.3063 train_time:440130ms step_avg:440.13ms
+step:1000/20000 val_loss:2.2601 val_bpb:1.3386 train_time:440488ms step_avg:440.49ms
+step:1100/20000 train_loss:2.1858 train_time:485243ms step_avg:441.13ms
+step:1200/20000 train_loss:2.3054 train_time:530055ms step_avg:441.71ms
+step:1300/20000 train_loss:2.2642 train_time:573909ms step_avg:441.47ms
+step:1361/20000 val_loss:2.2009 val_bpb:1.3035 train_time:600290ms step_avg:441.07ms
+stopping_early: wallclock_cap train_time:600290ms step:1361/20000
+peak memory allocated: 14455 MiB reserved: 14870 MiB
+Serialized model: 97161173 bytes
+Code size: 64170 bytes
+Total submission size: 97225343 bytes
+Serialized model int8+zlib: 19547901 bytes (payload:24844704 raw_torch:24909965 payload_ratio:3.91x)
+Total submission size int8+zlib: 19612071 bytes
+============================================================
+TALE: Greedy Layer Elimination Search
+============================================================
+TALE baseline: val_bpb=1.304996 layers=13
+TALE trial: skip=[0] val_bpb=4.192830
+TALE trial: skip=[1] val_bpb=1.918424
+TALE trial: skip=[2] val_bpb=1.582285
+TALE trial: skip=[3] val_bpb=1.479517
+TALE trial: skip=[4] val_bpb=1.405119
+TALE trial: skip=[5] val_bpb=1.381032
+TALE trial: skip=[6] val_bpb=1.382620
+TALE trial: skip=[7] val_bpb=1.360378
+TALE trial: skip=[8] val_bpb=1.355656
+TALE trial: skip=[9] val_bpb=1.359244
+TALE trial: skip=[10] val_bpb=1.361263
+TALE trial: skip=[11] val_bpb=1.417798
+TALE trial: skip=[12] val_bpb=1.608610
+TALE stopped: no improvement. Final skip=[], bpb=1.304996
+============================================================
+EVAL SWEEP: seq_len x scaling_method
+============================================================
+eval seq=1024 method=none val_loss:2.2025 val_bpb:1.3045 time:4619ms
+eval_exact seq=1024 method=none val_loss:2.20253927 val_bpb:1.30446782
+eval seq=2048 method=ntk val_loss:2.1816 val_bpb:1.2921 time:138827ms
+eval_exact seq=2048 method=ntk val_loss:2.18163405 val_bpb:1.29208657
+eval seq=2048 method=yarn val_loss:2.1885 val_bpb:1.2962 time:21166ms
+eval_exact seq=2048 method=yarn val_loss:2.18853571 val_bpb:1.29617412
+eval seq=4096 method=ntk val_loss:2.2175 val_bpb:1.3133 time:132082ms
+eval_exact seq=4096 method=ntk val_loss:2.21751931 val_bpb:1.31333984
+eval seq=4096 method=yarn val_loss:2.2710 val_bpb:1.3450 time:19491ms
+eval_exact seq=4096 method=yarn val_loss:2.27095522 val_bpb:1.34498760
+eval seq=8192 method=ntk val_loss:2.3701 val_bpb:1.4037 time:141788ms
+eval_exact seq=8192 method=ntk val_loss:2.37008834 val_bpb:1.40369981
+eval seq=8192 method=yarn val_loss:2.5707 val_bpb:1.5225 time:22231ms
+eval_exact seq=8192 method=yarn val_loss:2.57072466 val_bpb:1.52252795
+============================================================
+==========================================
+Training finished with status 0
+==========================================
