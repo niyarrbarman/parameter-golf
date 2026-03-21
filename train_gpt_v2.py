@@ -48,7 +48,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -70,7 +70,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     # Eval sweep: test multiple sequence lengths with NTK and YaRN RoPE scaling.
-    eval_seq_lens = [int(x) for x in os.environ.get("EVAL_SEQ_LENS", "1024,2048,4096,8192").split(",")]
+    eval_seq_lens = [int(x) for x in os.environ.get("EVAL_SEQ_LENS", "1024,2048").split(",")]
     # YaRN parameters (beta_fast/beta_slow control frequency interpolation boundaries).
     yarn_beta_fast = float(os.environ.get("YARN_BETA_FAST", 32.0))
     yarn_beta_slow = float(os.environ.get("YARN_BETA_SLOW", 1.0))
@@ -1215,6 +1215,7 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        _t_phase = time.perf_counter()
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1223,6 +1224,8 @@ def main() -> None:
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+        torch.cuda.synchronize()
+        _t_fwdbwd = time.perf_counter() - _t_phase
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1234,10 +1237,13 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        _t_phase = time.perf_counter()
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        torch.cuda.synchronize()
+        _t_opt = time.perf_counter() - _t_phase
         zero_grad_all()
 
         # Gradual magnitude pruning: zero out smallest weights on a cubic schedule.
@@ -1263,7 +1269,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"fwd_bwd:{1000*_t_fwdbwd:.0f}ms opt:{1000*_t_opt:.0f}ms lr_scale:{scale:.4f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1405,26 +1412,6 @@ def main() -> None:
         log0(f"eval_exact seq={eval_sl} method=ntk val_loss:{v_loss:.8f} val_bpb:{v_bpb:.8f}")
         restore_rope(base_model, args.rope_base)
 
-        # YaRN scaling.
-        base_model.load_state_dict(dequant_state_cpu, strict=True)
-        scale_rope_yarn(
-            base_model, args.train_seq_len, eval_sl, args.rope_base,
-            beta_fast=args.yarn_beta_fast, beta_slow=args.yarn_beta_slow,
-        )
-        torch.cuda.synchronize()
-        t_ev = time.perf_counter()
-        v_loss, v_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            seq_len_override=eval_sl,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"eval seq={eval_sl} method=yarn "
-            f"val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} "
-            f"time:{1000.0 * (time.perf_counter() - t_ev):.0f}ms"
-        )
-        log0(f"eval_exact seq={eval_sl} method=yarn val_loss:{v_loss:.8f} val_bpb:{v_bpb:.8f}")
         restore_rope(base_model, args.rope_base)
 
     log0("=" * 60)
