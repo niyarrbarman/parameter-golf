@@ -76,6 +76,13 @@ class Hyperparameters:
     yarn_beta_slow = float(os.environ.get("YARN_BETA_SLOW", 1.0))
     # Multi-token prediction: auxiliary loss on token t+2 improves sample efficiency.
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.0))
+    # Gradual magnitude pruning: train big, prune to compress.
+    target_sparsity = float(os.environ.get("TARGET_SPARSITY", 0.0))
+    prune_start_frac = float(os.environ.get("PRUNE_START_FRAC", 0.10))
+    prune_end_frac = float(os.environ.get("PRUNE_END_FRAC", 0.90))
+    prune_every = int(os.environ.get("PRUNE_EVERY", 100))
+    # TALE: greedy layer elimination at eval time.
+    tale_enabled = bool(int(os.environ.get("TALE_ENABLED", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -284,6 +291,58 @@ def eval_val(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_tale(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    skip_set: set[int],
+) -> tuple[float, float]:
+    """Eval using uncompiled base_model with layer skipping for TALE search."""
+    eval_seq_len = args.train_seq_len
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_seqs = local_batch_tokens // eval_seq_len
+    total_seqs = (val_tokens.numel() - 1) // eval_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    base_model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * eval_seq_len
+            raw_end = batch_seq_end * eval_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(-1, eval_seq_len)
+            y = local[1:].reshape(-1, eval_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = base_model.forward_with_skips(x, y, skip_set).detach()
+            batch_token_count = float(y.numel())
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
@@ -830,6 +889,33 @@ class GPT(nn.Module):
 
         return loss
 
+    def forward_with_skips(self, input_ids: Tensor, target_ids: Tensor, skip_set: set[int]) -> Tensor:
+        """Forward pass that skips layers in skip_set. Used for TALE eval (uncompiled)."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        bsz, seqlen = input_ids.shape
+        ve = self.val_embed(input_ids)
+        num_kv_heads = self.blocks[0].attn.num_kv_heads
+        head_dim = self.blocks[0].attn.head_dim
+        val_embed_out = ve.reshape(bsz, seqlen, num_kv_heads, head_dim).transpose(1, 2)
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            if i not in skip_set:
+                x = self.blocks[i](x, x0, val_embed_out=val_embed_out)
+            skips.append(x)  # always push to maintain stack alignment
+        for i in range(self.num_decoder_layers):
+            block_idx = self.num_encoder_layers + i
+            if skips:
+                skip_val = skips.pop()
+                if block_idx not in skip_set:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_val
+            if block_idx not in skip_set:
+                x = self.blocks[block_idx](x, x0, val_embed_out=val_embed_out)
+        h = self.final_norm(x)
+        logits = self._compute_logits(h.reshape(-1, h.size(-1)))
+        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+
 
 # -----------------------------
 # TRAINING
@@ -1014,6 +1100,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"eval_seq_lens:{args.eval_seq_lens} yarn_beta_fast:{args.yarn_beta_fast} yarn_beta_slow:{args.yarn_beta_slow}")
     log0(f"logit_softcap:{args.logit_softcap} mtp_loss_weight:{args.mtp_loss_weight}")
+    log0(f"target_sparsity:{args.target_sparsity} prune_every:{args.prune_every} tale_enabled:{args.tale_enabled}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1153,6 +1240,20 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # Gradual magnitude pruning: zero out smallest weights on a cubic schedule.
+        if args.target_sparsity > 0 and step % args.prune_every == 0:
+            prune_start_step = int(args.prune_start_frac * args.iterations)
+            prune_end_step = int(args.prune_end_frac * args.iterations)
+            if prune_start_step < step <= prune_end_step:
+                frac = (step - prune_start_step) / max(prune_end_step - prune_start_step, 1)
+                current_sparsity = args.target_sparsity * (1 - (1 - frac) ** 3)
+                all_mags = torch.cat([p.data.abs().flatten() for p in matrix_params])
+                k = int(current_sparsity * all_mags.numel())
+                if k > 0:
+                    threshold = torch.kthvalue(all_mags, k).values.item()
+                    for p in matrix_params:
+                        p.data[p.data.abs() <= threshold] = 0.0
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1219,12 +1320,52 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
 
+    dequant_state_cpu = dequantize_state_dict_int8(quant_state)
+
+    # --- TALE: Greedy Layer Elimination ---
+    best_skip_set: set[int] = set()
+    if args.tale_enabled:
+        log0("=" * 60)
+        log0("TALE: Greedy Layer Elimination Search")
+        log0("=" * 60)
+        base_model.load_state_dict(dequant_state_cpu, strict=True)
+        _, tale_base_bpb = eval_val_tale(
+            args, base_model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            skip_set=set(),
+        )
+        log0(f"TALE baseline: val_bpb={tale_base_bpb:.6f} layers={args.num_layers}")
+        best_tale_bpb = tale_base_bpb
+        while True:
+            candidates = [i for i in range(args.num_layers) if i not in best_skip_set]
+            if not candidates:
+                break
+            best_candidate = None
+            best_candidate_bpb = best_tale_bpb
+            for layer_idx in candidates:
+                trial_set = best_skip_set | {layer_idx}
+                base_model.load_state_dict(dequant_state_cpu, strict=True)
+                _, trial_bpb = eval_val_tale(
+                    args, base_model, rank, world_size, device, grad_accum_steps,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                    skip_set=trial_set,
+                )
+                log0(f"TALE trial: skip={sorted(trial_set)} val_bpb={trial_bpb:.6f}")
+                if trial_bpb < best_candidate_bpb:
+                    best_candidate = layer_idx
+                    best_candidate_bpb = trial_bpb
+            if best_candidate is not None and best_candidate_bpb < best_tale_bpb:
+                best_skip_set.add(best_candidate)
+                best_tale_bpb = best_candidate_bpb
+                log0(f"TALE accepted: drop layer {best_candidate}, skip={sorted(best_skip_set)}, bpb={best_tale_bpb:.6f}")
+            else:
+                log0(f"TALE stopped: no improvement. Final skip={sorted(best_skip_set)}, bpb={best_tale_bpb:.6f}")
+                break
+
     # --- Eval sweep: test each seq_len with no scaling, NTK, and YaRN ---
     log0("=" * 60)
     log0("EVAL SWEEP: seq_len x scaling_method")
     log0("=" * 60)
-
-    dequant_state_cpu = dequantize_state_dict_int8(quant_state)
 
     for eval_sl in sorted(args.eval_seq_lens):
         if eval_sl == args.train_seq_len:

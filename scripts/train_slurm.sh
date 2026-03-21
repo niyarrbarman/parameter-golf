@@ -50,8 +50,11 @@ TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 EVAL_SEQ_LENS="${EVAL_SEQ_LENS:-1024,2048,4096,8192}"
 YARN_BETA_FAST="${YARN_BETA_FAST:-32.0}"
 YARN_BETA_SLOW="${YARN_BETA_SLOW:-1.0}"
-LOGIT_SOFTCAP="${LOGIT_SOFTCAP:-15.0}"
-MTP_LOSS_WEIGHT="${MTP_LOSS_WEIGHT:-0.3}"
+LOGIT_SOFTCAP="${LOGIT_SOFTCAP:-30.0}"
+MTP_LOSS_WEIGHT="${MTP_LOSS_WEIGHT:-0.0}"
+TARGET_SPARSITY="${TARGET_SPARSITY:-0.0}"
+PRUNE_EVERY="${PRUNE_EVERY:-100}"
+TALE_ENABLED="${TALE_ENABLED:-0}"
 
 # --- Derived paths ------------------------------------------------------------
 DATA_PATH="${DATA_ROOT}/datasets/fineweb10B_${VARIANT}"
@@ -84,6 +87,7 @@ echo "Script:      ${TRAIN_SCRIPT}"
 echo "Eval seqlens:${EVAL_SEQ_LENS}"
 echo "YaRN:       beta_fast=${YARN_BETA_FAST} beta_slow=${YARN_BETA_SLOW}"
 echo "Softcap:    ${LOGIT_SOFTCAP} MTP weight: ${MTP_LOSS_WEIGHT}"
+echo "Sparsity:   ${TARGET_SPARSITY} prune_every: ${PRUNE_EVERY} TALE: ${TALE_ENABLED}"
 echo "=========================================="
 
 # --- Verify data exists -------------------------------------------------------
@@ -123,6 +127,9 @@ srun apptainer exec \
     --env "YARN_BETA_SLOW=${YARN_BETA_SLOW}" \
     --env "LOGIT_SOFTCAP=${LOGIT_SOFTCAP}" \
     --env "MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT}" \
+    --env "TARGET_SPARSITY=${TARGET_SPARSITY}" \
+    --env "PRUNE_EVERY=${PRUNE_EVERY}" \
+    --env "TALE_ENABLED=${TALE_ENABLED}" \
     --bind /tmpdir,/work --nv "${CONTAINER}" \
     torchrun \
         --nnodes=${NNODES} \
